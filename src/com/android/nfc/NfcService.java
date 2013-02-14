@@ -37,7 +37,6 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.database.ContentObserver;
 import android.media.AudioManager;
 import android.media.SoundPool;
 import android.net.Uri;
