@@ -41,6 +41,7 @@ bool gUseStaticPipe = false;    // if true, use gGatePipe as static pipe id.  if
 namespace android
 {
     extern void startRfDiscovery (bool isStart);
+    extern void setUiccIdleTimeout (bool enable);
 }
 
 //////////////////////////////////////////////
@@ -177,6 +178,8 @@ bool SecureElement::initialize (nfc_jni_native_data* native)
     mbNewEE         = true;
     mNewPipeId      = 0;
     mNewSourceGate  = 0;
+    mRfFieldIsOn    = false;
+    mActivatedInListenMode = false;
     mCurrentRouteSelection = NoRoute;
     memset (mEeInfo, 0, sizeof(mEeInfo));
     memset (&mUiccInfo, 0, sizeof(mUiccInfo));
@@ -245,7 +248,6 @@ void SecureElement::finalize ()
 {
     static const char fn [] = "SecureElement::finalize";
     ALOGD ("%s: enter", fn);
-    tNFA_STATUS nfaStat = NFA_STATUS_FAILED;
 
     NFA_EeDeregister (nfaEeCallback);
 
@@ -534,7 +536,6 @@ bool SecureElement::activate (jint seID)
 bool SecureElement::deactivate (jint seID)
 {
     static const char fn [] = "SecureElement::deactivate";
-    tNFA_STATUS nfaStat = NFA_STATUS_FAILED;
     bool retval = false;
 
     ALOGD ("%s: enter; seID=0x%X, mActiveEeHandle=0x%X", fn, seID, mActiveEeHandle);
@@ -686,6 +687,9 @@ bool SecureElement::connectEE ()
 
     // Disable RF discovery completely while the DH is connected
     android::startRfDiscovery(false);
+
+    // Disable UICC idle timeout while the DH is connected
+    android::setUiccIdleTimeout (false);
 
     mNewSourceGate = 0;
 
@@ -867,12 +871,17 @@ bool SecureElement::disconnectEE (jint seID)
         else
             ALOGE ("%s: fail dealloc gate; error=0x%X", fn, nfaStat);
     }
+
     mIsPiping = false;
+
+    // Re-enable UICC low-power mode
+    android::setUiccIdleTimeout (true);
     // Re-enable RF discovery
     // Note that it only effactuates the current configuration,
     // so if polling/listening were configured OFF (forex because
     // the screen was off), they will stay OFF with this call.
     android::startRfDiscovery(true);
+
     return true;
 }
 
@@ -1068,6 +1077,33 @@ void SecureElement::notifyRfFieldEvent (bool isActive)
         e->ExceptionClear();
         ALOGE ("%s: fail notify", fn);
     }
+    ALOGD ("%s: exit", fn);
+}
+
+/*******************************************************************************
+**
+** Function:        resetRfFieldStatus
+**
+** Description:     Resets the field status.
+**                  isActive: Whether any secure element is activated.
+**
+** Returns:         None
+**
+*******************************************************************************/
+void SecureElement::resetRfFieldStatus ()
+{
+    static const char fn [] = "SecureElement::resetRfFieldStatus`";
+    ALOGD ("%s: enter;");
+
+    mMutex.lock();
+    mRfFieldIsOn = false;
+    int ret = clock_gettime (CLOCK_MONOTONIC, &mLastRfFieldToggle);
+    if (ret == -1) {
+        ALOGE("%s: clock_gettime failed", fn);
+        // There is no good choice here...
+    }
+    mMutex.unlock();
+
     ALOGD ("%s: exit", fn);
 }
 

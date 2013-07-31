@@ -37,11 +37,9 @@ extern "C"
     #include "rw_api.h"
     #include "nfa_ee_api.h"
     #include "nfc_brcm_defs.h"
-    #include "nfa_cho_api.h"
     #include "ce_api.h"
 }
 
-extern UINT8 *p_nfa_dm_lptd_cfg;
 extern UINT8 *p_nfa_dm_start_up_cfg;
 extern const UINT8 nfca_version_string [];
 namespace android
@@ -78,6 +76,7 @@ namespace android
     jmethodID               gCachedNfcManagerNotifyTransactionListeners;
     jmethodID               gCachedNfcManagerNotifyLlcpLinkActivation;
     jmethodID               gCachedNfcManagerNotifyLlcpLinkDeactivated;
+    jmethodID               gCachedNfcManagerNotifyLlcpFirstPacketReceived;
     jmethodID               gCachedNfcManagerNotifySeFieldActivated;
     jmethodID               gCachedNfcManagerNotifySeFieldDeactivated;
     jmethodID               gCachedNfcManagerNotifySeListenActivated;
@@ -92,6 +91,7 @@ namespace android
     void                    doStartupConfig ();
     void                    startStopPolling (bool isStartPolling);
     void                    startRfDiscovery (bool isStart);
+    void                    setUiccIdleTimeout (bool enable);
 }
 
 
@@ -111,6 +111,7 @@ static SyncEvent            sNfaEnableEvent;  //event for NFA_Enable()
 static SyncEvent            sNfaDisableEvent;  //event for NFA_Disable()
 static SyncEvent            sNfaEnableDisablePollingEvent;  //event for NFA_EnablePolling(), NFA_DisablePolling()
 static SyncEvent            sNfaSetConfigEvent;  // event for Set_Config....
+static SyncEvent            sNfaGetConfigEvent;  // event for Get_Config....
 static bool                 sIsNfaEnabled = false;
 static bool                 sDiscoveryEnabled = false;  //is polling for tag?
 static bool                 sIsDisabling = false;
@@ -119,8 +120,6 @@ static bool                 sSeRfActive = false;  // whether RF with SE is likel
 static bool                 sP2pActive = false; // whether p2p was last active
 static bool                 sAbortConnlessWait = false;
 static bool                 sIsSecElemSelected = false;  //has NFC service selected a sec elem
-static UINT8 *              sOriginalLptdCfg = NULL;
-#define CONFIG_UPDATE_LPTD          (1 << 0)
 #define CONFIG_UPDATE_TECH_MASK     (1 << 1)
 #define DEFAULT_TECH_MASK           (NFA_TECHNOLOGY_MASK_A \
                                      | NFA_TECHNOLOGY_MASK_B \
@@ -128,7 +127,8 @@ static UINT8 *              sOriginalLptdCfg = NULL;
                                      | NFA_TECHNOLOGY_MASK_ISO15693 \
                                      | NFA_TECHNOLOGY_MASK_B_PRIME \
                                      | NFA_TECHNOLOGY_MASK_A_ACTIVE \
-                                     | NFA_TECHNOLOGY_MASK_F_ACTIVE)
+                                     | NFA_TECHNOLOGY_MASK_F_ACTIVE \
+                                     | NFA_TECHNOLOGY_MASK_KOVIO)
 
 
 static void nfaConnectionCallback (UINT8 event, tNFA_CONN_EVT_DATA *eventData);
@@ -136,6 +136,8 @@ static void nfaDeviceManagementCallback (UINT8 event, tNFA_DM_CBACK_DATA *eventD
 static bool isPeerToPeer (tNFA_ACTIVATED& activated);
 static bool isListenMode(tNFA_ACTIVATED& activated);
 
+static UINT16 sCurrentConfigLen;
+static UINT8 sConfig[256];
 /////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////
 
@@ -208,7 +210,13 @@ static void nfaConnectionCallback (UINT8 connEvent, tNFA_CONN_EVT_DATA* eventDat
     tNFA_STATUS status = NFA_STATUS_FAILED;
     ALOGD("%s: event= %u", __FUNCTION__, connEvent);
 
-    if (gIsTagDeactivating && connEvent != NFA_DEACTIVATED_EVT && connEvent != NFA_PRESENCE_CHECK_EVT && connEvent != NFA_DATA_EVT)
+    // TODO this if can probably be completely removed. It's unclear why this
+    // was present in the initial code drop - either to work around NFCC,
+    // stack or certain NFC tags bugs. Until we verify removing it doesn't
+    // break things, leave it be.
+    if (gIsTagDeactivating && connEvent != NFA_DEACTIVATED_EVT &&
+            connEvent != NFA_PRESENCE_CHECK_EVT && connEvent != NFA_DATA_EVT &&
+            connEvent != NFA_RW_INTF_ERROR_EVT)
     {
         // special case to switching frame interface for ISO_DEP tags
         gIsTagDeactivating = false;
@@ -292,7 +300,7 @@ static void nfaConnectionCallback (UINT8 connEvent, tNFA_CONN_EVT_DATA* eventDat
 
     case NFA_ACTIVATED_EVT: // NFC link/protocol activated
         ALOGD("%s: NFA_ACTIVATED_EVT: gIsSelectingRfInterface=%d, sIsDisabling=%d", __FUNCTION__, gIsSelectingRfInterface, sIsDisabling);
-        if (sIsDisabling)
+        if (sIsDisabling || !sIsNfaEnabled)
             break;
 
         NfcTag::getInstance().setActivationState ();
@@ -317,13 +325,15 @@ static void nfaConnectionCallback (UINT8 connEvent, tNFA_CONN_EVT_DATA* eventDat
             } else {
                 ALOGE ("%s: Failed to disable RF field events", __FUNCTION__);
             }
+            // For the SE, consider the field to be on while p2p is active.
+            SecureElement::getInstance().notifyRfFieldEvent (true);
         }
         else if (pn544InteropIsBusy() == false)
         {
             NfcTag::getInstance().connectionEventHandler (connEvent, eventData);
 
             // We know it is not activating for P2P.  If it activated in
-            // listen mode then it is likely for and SE transaction.
+            // listen mode then it is likely for an SE transaction.
             // Send the RF Event.
             if (isListenMode(eventData->activated))
             {
@@ -356,21 +366,27 @@ static void nfaConnectionCallback (UINT8 connEvent, tNFA_CONN_EVT_DATA* eventDat
         {
             if (sSeRfActive) {
                 sSeRfActive = false;
-                SecureElement::getInstance().notifyListenModeState (false);
+                if (!sIsDisabling && sIsNfaEnabled)
+                    SecureElement::getInstance().notifyListenModeState (false);
             } else if (sP2pActive) {
                 sP2pActive = false;
                 // Make sure RF field events are re-enabled
-                ALOGD("%s: NFA_ACTIVATED_EVT; is p2p", __FUNCTION__);
+                ALOGD("%s: NFA_DEACTIVATED_EVT; is p2p", __FUNCTION__);
                 // Disable RF field events in case of p2p
                 UINT8  nfa_enable_rf_events[] = { 0x01 };
 
-                ALOGD ("%s: Enabling RF field events", __FUNCTION__);
-                status = NFA_SetConfig(NCI_PARAM_ID_RF_FIELD_INFO, sizeof(nfa_enable_rf_events),
-                        &nfa_enable_rf_events[0]);
-                if (status == NFA_STATUS_OK) {
-                    ALOGD ("%s: Enabled RF field events", __FUNCTION__);
-                } else {
-                    ALOGE ("%s: Failed to enable RF field events", __FUNCTION__);
+                if (!sIsDisabling && sIsNfaEnabled)
+                {
+                    ALOGD ("%s: Enabling RF field events", __FUNCTION__);
+                    status = NFA_SetConfig(NCI_PARAM_ID_RF_FIELD_INFO, sizeof(nfa_enable_rf_events),
+                            &nfa_enable_rf_events[0]);
+                    if (status == NFA_STATUS_OK) {
+                        ALOGD ("%s: Enabled RF field events", __FUNCTION__);
+                    } else {
+                        ALOGE ("%s: Failed to enable RF field events", __FUNCTION__);
+                    }
+                    // Consider the field to be off at this point
+                    SecureElement::getInstance().notifyRfFieldEvent (false);
                 }
             }
         }
@@ -460,12 +476,14 @@ static void nfaConnectionCallback (UINT8 connEvent, tNFA_CONN_EVT_DATA* eventDat
         ALOGD("%s: NFA_LLCP_DEACTIVATED_EVT", __FUNCTION__);
         PeerToPeer::getInstance().llcpDeactivatedHandler (getNative(0, 0), eventData->llcp_deactivated);
         break;
-
+    case NFA_LLCP_FIRST_PACKET_RECEIVED_EVT: // Received first packet over llcp
+        ALOGD("%s: NFA_LLCP_FIRST_PACKET_RECEIVED_EVT", __FUNCTION__);
+        PeerToPeer::getInstance().llcpFirstPacketHandler (getNative(0, 0));
+        break;
     case NFA_PRESENCE_CHECK_EVT:
         ALOGD("%s: NFA_PRESENCE_CHECK_EVT", __FUNCTION__);
         nativeNfcTag_doPresenceCheckResult (eventData->status);
         break;
-
     case NFA_FORMAT_CPLT_EVT:
         ALOGD("%s: NFA_FORMAT_CPLT_EVT: status=0x%X", __FUNCTION__, eventData->status);
         nativeNfcTag_formatStatus (eventData->status == NFA_STATUS_OK);
@@ -532,6 +550,8 @@ static jboolean nfcManager_initNativeStruc (JNIEnv* e, jobject o)
             "notifyLlcpLinkActivation", "(Lcom/android/nfc/dhimpl/NativeP2pDevice;)V");
     gCachedNfcManagerNotifyLlcpLinkDeactivated = e->GetMethodID(cls.get(),
             "notifyLlcpLinkDeactivated", "(Lcom/android/nfc/dhimpl/NativeP2pDevice;)V");
+    gCachedNfcManagerNotifyLlcpFirstPacketReceived = e->GetMethodID(cls.get(),
+            "notifyLlcpLinkFirstPacketReceived", "(Lcom/android/nfc/dhimpl/NativeP2pDevice;)V");
     sCachedNfcManagerNotifyTargetDeselected = e->GetMethodID(cls.get(),
             "notifyTargetDeselected","()V");
     gCachedNfcManagerNotifySeFieldActivated = e->GetMethodID(cls.get(),
@@ -617,14 +637,32 @@ void nfaDeviceManagementCallback (UINT8 dmEvent, tNFA_DM_CBACK_DATA* eventData)
 
     case NFA_DM_GET_CONFIG_EVT: /* Result of NFA_GetConfig */
         ALOGD ("%s: NFA_DM_GET_CONFIG_EVT", __FUNCTION__);
+        {
+            SyncEventGuard guard (sNfaGetConfigEvent);
+            if (eventData->status == NFA_STATUS_OK &&
+                    eventData->get_config.tlv_size <= sizeof(sConfig))
+            {
+                sCurrentConfigLen = eventData->get_config.tlv_size;
+                memcpy(sConfig, eventData->get_config.param_tlvs, eventData->get_config.tlv_size);
+            }
+            else
+            {
+                ALOGE("%s: NFA_DM_GET_CONFIG failed", __FUNCTION__);
+                sCurrentConfigLen = 0;
+            }
+            sNfaGetConfigEvent.notifyOne();
+        }
         break;
 
     case NFA_DM_RF_FIELD_EVT:
         ALOGD ("%s: NFA_DM_RF_FIELD_EVT; status=0x%X; field status=%u", __FUNCTION__,
               eventData->rf_field.status, eventData->rf_field.rf_field_status);
+        if (sIsDisabling || !sIsNfaEnabled)
+            break;
 
-        if (!sIsDisabling && eventData->rf_field.status == NFA_STATUS_OK)
-            SecureElement::getInstance().notifyRfFieldEvent (eventData->rf_field.rf_field_status == NFA_DM_RF_FIELD_ON);
+        if (!sP2pActive && eventData->rf_field.status == NFA_STATUS_OK)
+            SecureElement::getInstance().notifyRfFieldEvent (
+                    eventData->rf_field.rf_field_status == NFA_DM_RF_FIELD_ON);
         break;
 
     case NFA_DM_NFCC_TRANSPORT_ERR_EVT:
@@ -728,9 +766,7 @@ static jboolean nfcManager_doInitialize (JNIEnv* e, jobject o)
                 NFC_SetTraceLevel (num);
                 RW_SetTraceLevel (num);
                 NFA_SetTraceLevel (num);
-                NFA_ChoSetTraceLevel (num);
                 NFA_P2pSetTraceLevel (num);
-                NFA_SnepSetTraceLevel (num);
                 sNfaEnableEvent.wait(); //wait for NFA command to finish
             }
         }
@@ -760,10 +796,6 @@ static jboolean nfcManager_doInitialize (JNIEnv* e, jobject o)
 
                     ALOGD ("%s: tag polling tech mask=0x%X", __FUNCTION__, nat->tech_mask);
                 }
-
-                // Always restore LPTD Configuration to the stack default.
-                if (sOriginalLptdCfg != NULL)
-                    p_nfa_dm_lptd_cfg = sOriginalLptdCfg;
 
                 // if this value exists, set polling interval.
                 if (GetNumValue(NAME_NFA_DM_DISC_DURATION_POLL, &num, sizeof(num)))
@@ -911,10 +943,52 @@ void nfcManager_disableDiscovery (JNIEnv*, jobject)
     if (! PowerSwitch::getInstance ().setModeOff (PowerSwitch::DISCOVERY))
         PowerSwitch::getInstance ().setLevel (PowerSwitch::LOW_POWER);
 
+    // We may have had RF field notifications that did not cause
+    // any activate/deactive events. For example, caused by wireless
+    // charging orbs. Those may cause us to go to sleep while the last
+    // field event was indicating a field. To prevent sticking in that
+    // state, always reset the rf field status when we disable discovery.
+    SecureElement::getInstance().resetRfFieldStatus();
 TheEnd:
     ALOGD ("%s: exit", __FUNCTION__);
 }
 
+void setUiccIdleTimeout (bool enable)
+{
+    // This method is *NOT* thread-safe. Right now
+    // it is only called from the same thread so it's
+    // not an issue.
+    tNFA_STATUS stat = NFA_STATUS_OK;
+    UINT8 swp_cfg_byte0 = 0x00;
+    {
+        SyncEventGuard guard (sNfaGetConfigEvent);
+        stat = NFA_GetConfig(1, new tNFA_PMID[1] {0xC2});
+        if (stat != NFA_STATUS_OK)
+        {
+            ALOGE("%s: NFA_GetConfig failed", __FUNCTION__);
+            return;
+        }
+        sNfaGetConfigEvent.wait ();
+        if (sCurrentConfigLen < 4 || sConfig[1] != 0xC2) {
+            ALOGE("%s: Config TLV length %d returned is too short", __FUNCTION__,
+                    sCurrentConfigLen);
+            return;
+        }
+        swp_cfg_byte0 = sConfig[3];
+    }
+    SyncEventGuard guard(sNfaSetConfigEvent);
+    if (enable)
+        swp_cfg_byte0 |= 0x01;
+    else
+        swp_cfg_byte0 &= ~0x01;
+
+    stat = NFA_SetConfig(0xC2, 1, &swp_cfg_byte0);
+    if (stat == NFA_STATUS_OK)
+        sNfaSetConfigEvent.wait ();
+    else
+        ALOGE("%s: Could not configure UICC idle timeout feature", __FUNCTION__);
+    return;
+}
 /*******************************************************************************
 **
 ** Function         nfc_jni_cache_object_local
@@ -1214,6 +1288,12 @@ static void nfcManager_doSelectSecureElement(JNIEnv*, jobject)
     ALOGD ("%s: enter", __FUNCTION__);
     bool stat = true;
 
+    if (sIsSecElemSelected)
+    {
+        ALOGD ("%s: already selected", __FUNCTION__);
+        goto TheEnd;
+    }
+
     PowerSwitch::getInstance ().setLevel (PowerSwitch::FULL_POWER);
 
     if (sRfEnabled) {
@@ -1221,22 +1301,14 @@ static void nfcManager_doSelectSecureElement(JNIEnv*, jobject)
         startRfDiscovery (false);
     }
 
-    if (sIsSecElemSelected)
-    {
-        ALOGD ("%s: already selected", __FUNCTION__);
-        goto TheEnd;
-    }
-
     stat = SecureElement::getInstance().activate (0xABCDEF);
     if (stat)
         SecureElement::getInstance().routeToSecureElement ();
     sIsSecElemSelected = true;
 
-TheEnd:
     startRfDiscovery (true);
-
     PowerSwitch::getInstance ().setModeOn (PowerSwitch::SE_ROUTING);
-
+TheEnd:
     ALOGD ("%s: exit", __FUNCTION__);
 }
 
@@ -1673,64 +1745,12 @@ void doStartupConfig()
     struct nfc_jni_native_data *nat = getNative(0, 0);
     tNFA_STATUS stat = NFA_STATUS_FAILED;
 
-    // Enable the "RC workaround" to allow our stack/firmware to work with a retail
-    // Nexus S that causes IOP issues.  Only enable if value exists and set to 1.
-    if (GetNumValue(NAME_USE_NXP_P2P_RC_WORKAROUND, &num, sizeof(num)) && (num == 1))
-    {
-#if (NCI_VERSION > NCI_VERSION_20791B0)
-        UINT8  nfa_dm_rc_workaround[] = { 0x03, 0x0f, 0xab };
-#else
-        UINT8  nfa_dm_rc_workaround[] = { 0x01, 0x0f, 0xab, 0x01 };
-#endif
-
-        ALOGD ("%s: Configure RC work-around", __FUNCTION__);
-        SyncEventGuard guard (sNfaSetConfigEvent);
-        stat = NFA_SetConfig(NCI_PARAM_ID_FW_WORKAROUND, sizeof(nfa_dm_rc_workaround), &nfa_dm_rc_workaround[0]);
-        if (stat == NFA_STATUS_OK)
-            sNfaSetConfigEvent.wait ();
-    }
-
     // If polling for Active mode, set the ordering so that we choose Active over Passive mode first.
     if (nat && (nat->tech_mask & (NFA_TECHNOLOGY_MASK_A_ACTIVE | NFA_TECHNOLOGY_MASK_F_ACTIVE)))
     {
         UINT8  act_mode_order_param[] = { 0x01 };
         SyncEventGuard guard (sNfaSetConfigEvent);
         stat = NFA_SetConfig(NCI_PARAM_ID_ACT_ORDER, sizeof(act_mode_order_param), &act_mode_order_param[0]);
-        if (stat == NFA_STATUS_OK)
-            sNfaSetConfigEvent.wait ();
-    }
-
-    // Set configuration to allow UICC to Power off if there is no traffic.
-    if (GetNumValue(NAME_UICC_IDLE_TIMEOUT, &num, sizeof(num)) && (num != 0))
-    {
-        // 61 => The least significant bit of this byte enables the power off when Idle mode.
-        // 00 87 93 03 == > These 4 bytes form a 4 byte value which decides the idle timeout(in us)
-        //                  value to trigger the uicc deactivation.
-        // e.g. in current example its value is 0x3938700 i.e. 60000000 is 60 seconds.
-        UINT8  swpcfg_param[] = { 0x61, 0x00, 0x82, 0x04, 0x20, 0xA1, 0x07, 0x00,
-                                  0x90, 0xD0, 0x03, 0x00, 0x00, 0x87, 0x93, 0x03 };
-
-        ALOGD ("%s: Configure UICC idle-timeout to %lu ms", __FUNCTION__, num);
-
-        // Set the timeout from the .conf file value.
-        num *= 1000;
-        UINT8 * p = &swpcfg_param[12];
-        UINT32_TO_STREAM(p, num)
-
-        SyncEventGuard guard (sNfaSetConfigEvent);
-        stat = NFA_SetConfig(NCI_PARAM_ID_SWPCFG, sizeof(swpcfg_param), &swpcfg_param[0]);
-        if (stat == NFA_STATUS_OK)
-            sNfaSetConfigEvent.wait ();
-    }
-
-    // Set antenna tuning configuration if configured.
-#define PREINIT_DSP_CFG_SIZE    30
-    UINT8   preinit_dsp_param[PREINIT_DSP_CFG_SIZE];
-
-    if (GetStrValue(NAME_PREINIT_DSP_CFG, (char*)&preinit_dsp_param[0], sizeof(preinit_dsp_param)))
-    {
-        SyncEventGuard guard (sNfaSetConfigEvent);
-        stat = NFA_SetConfig(NCI_PARAM_ID_PREINIT_DSP_CFG, sizeof(preinit_dsp_param), &preinit_dsp_param[0]);
         if (stat == NFA_STATUS_OK)
             sNfaSetConfigEvent.wait ();
     }

@@ -25,6 +25,15 @@
 #include "JavaClassConstants.h"
 #include <ScopedLocalRef.h>
 
+/* Some older PN544-based solutions would only send the first SYMM back
+ * (as an initiator) after the full LTO (750ms). But our connect timer
+ * starts immediately, and hence we may timeout if the timer is set to
+ * 1000 ms. Worse, this causes us to immediately connect to the NPP
+ * socket, causing concurrency issues in that stack. Increase the default
+ * timeout to 2000 ms, giving us enough time to complete the first connect.
+ */
+#define LLCP_DATA_LINK_TIMEOUT    2000
+
 using namespace android;
 
 namespace android
@@ -389,7 +398,31 @@ void PeerToPeer::llcpDeactivatedHandler (nfc_jni_native_data* nat, tNFA_LLCP_DEA
     ALOGD ("%s: exit", fn);
 }
 
+void PeerToPeer::llcpFirstPacketHandler (nfc_jni_native_data* nat)
+{
+    static const char fn [] = "PeerToPeer::llcpFirstPacketHandler";
+    ALOGD ("%s: enter", fn);
 
+    JNIEnv* e = NULL;
+    ScopedAttach attach(nat->vm, &e);
+    if (e == NULL)
+    {
+        ALOGE ("%s: jni env is null", fn);
+        return;
+    }
+
+    ALOGD ("%s: notify nfc service", fn);
+    /* Notify manager that the LLCP is lost or deactivated */
+    e->CallVoidMethod (nat->manager, android::gCachedNfcManagerNotifyLlcpFirstPacketReceived, nat->tag);
+    if (e->ExceptionCheck())
+    {
+        e->ExceptionClear();
+        ALOGE ("%s: fail notify", fn);
+    }
+
+    ALOGD ("%s: exit", fn);
+
+}
 /*******************************************************************************
 **
 ** Function:        accept
@@ -1567,7 +1600,7 @@ bool P2pServer::registerWithStack()
            0, //use 0 for infinite timeout for symmetry procedure when acting as initiator
            0, //use 0 for infinite timeout for symmetry procedure when acting as target
            LLCP_DELAY_RESP_TIME,
-           LLCP_DATA_LINK_CONNECTION_TOUT,
+           LLCP_DATA_LINK_TIMEOUT,
            LLCP_DELAY_TIME_TO_SEND_FIRST_PDU);
    if (stat != NFA_STATUS_OK)
        ALOGE ("%s: fail set LLCP config; error=0x%X", fn, stat);
